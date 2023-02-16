@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -77,6 +78,7 @@ type KopsControlPlaneReconciler struct {
 	log                          logr.Logger
 	Recorder                     record.EventRecorder
 	TfExecPath                   string
+	spotinstMutex                sync.Mutex
 	BuildCloudFactory            func(*kopsapi.Cluster) (fi.Cloud, error)
 	PopulateClusterSpecFactory   func(kopsCluster *kopsapi.Cluster, kopsClientset simple.Clientset, cloud fi.Cloud) (*kopsapi.Cluster, error)
 	PrepareCloudResourcesFactory func(kopsClientset simple.Clientset, kubeClient client.Client, ctx context.Context, kopsCluster *kopsapi.Cluster, kopsControlPlane *controlplanev1alpha1.KopsControlPlane, configBase, terraformOutputDir string, cloud fi.Cloud, shouldIgnoreSG bool) error
@@ -373,6 +375,63 @@ func (r *KopsControlPlaneReconciler) reconcileKubeconfig(ctx context.Context, ko
 	return nil
 }
 
+func (r *KopsControlPlaneReconciler) generateTerraformFiles(ctx context.Context, kopsControlPlane *controlplanev1alpha1.KopsControlPlane, kopsCluster *kopsapi.Cluster, terraformOutputDir string, shouldIgnoreSG bool) error {
+	// Since Spotinst depends on Kops feature flags we need to ensure that
+	// concurrent reconciles not interfere with each other during the
+	// terraform manifests creation
+	r.spotinstMutex.Lock()
+	defer r.spotinstMutex.Unlock()
+
+	err := utils.ParseSpotinstFeatureflags(kopsControlPlane)
+	if err != nil {
+		return err
+	}
+	cloud, err := r.BuildCloudFactory(kopsCluster)
+	if err != nil {
+		r.log.Error(err, "failed to build cloud")
+		return err
+	}
+
+	fullCluster, err := r.PopulateClusterSpecFactory(kopsCluster, r.kopsClientset, cloud)
+	if err != nil {
+		r.log.Error(err, "failed to populated cluster Spec")
+		return err
+	}
+
+	err = r.createOrUpdateKopsCluster(ctx, r.kopsClientset, fullCluster, kopsControlPlane.Spec.SSHPublicKey, cloud)
+	if err != nil {
+		r.log.Error(err, fmt.Sprintf("failed to manage kops state: %v", err))
+		conditions.MarkFalse(kopsControlPlane, controlplanev1alpha1.KopsControlPlaneStateReadyCondition, controlplanev1alpha1.KopsControlPlaneStateReconciliationFailedReason, clusterv1.ConditionSeverityError, err.Error())
+		return err
+	}
+	conditions.MarkTrue(kopsControlPlane, controlplanev1alpha1.KopsControlPlaneStateReadyCondition)
+
+	if kopsControlPlane.Spec.KopsSecret != nil {
+		secretStore, err := r.kopsClientset.SecretStore(kopsCluster)
+		if err != nil {
+			return err
+		}
+
+		err = utils.ReconcileKopsSecrets(ctx, r.Client, secretStore, kopsControlPlane, client.ObjectKey{
+			Name:      kopsControlPlane.Spec.KopsSecret.Name,
+			Namespace: kopsControlPlane.Spec.KopsSecret.Namespace,
+		})
+		if err != nil {
+			conditions.MarkFalse(kopsControlPlane, controlplanev1alpha1.KopsControlPlaneSecretsReadyCondition, controlplanev1alpha1.KopsControlPlaneSecretsReconciliationFailedReason, clusterv1.ConditionSeverityWarning, err.Error())
+		}
+		conditions.MarkTrue(kopsControlPlane, controlplanev1alpha1.KopsControlPlaneSecretsReadyCondition)
+	}
+
+	err = r.PrepareCloudResourcesFactory(r.kopsClientset, r.Client, ctx, kopsCluster, kopsControlPlane, fullCluster.Spec.ConfigBase, terraformOutputDir, cloud, shouldIgnoreSG)
+	if err != nil {
+		conditions.MarkFalse(kopsControlPlane, controlplanev1alpha1.KopsTerraformGenerationReadyCondition, controlplanev1alpha1.KopsTerraformGenerationReconciliationFailedReason, clusterv1.ConditionSeverityError, err.Error())
+		r.log.Error(err, fmt.Sprintf("failed to prepare cloud resources: %v", err))
+		return err
+	}
+
+	return nil
+}
+
 //+kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kopscontrolplanes,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kopscontrolplanes/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kopscontrolplanes/finalizers,verbs=update
@@ -451,57 +510,15 @@ func (r *KopsControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		Spec: kopsControlPlane.Spec.KopsClusterSpec,
 	}
 
-	err = utils.ParseSpotinstFeatureflags(kopsControlPlane)
-	if err != nil {
-		return resultError, err
-	}
-	cloud, err := r.BuildCloudFactory(kopsCluster)
-	if err != nil {
-		r.log.Error(rerr, "failed to build cloud")
-		return resultError, err
-	}
-
-	fullCluster, err := r.PopulateClusterSpecFactory(kopsCluster, r.kopsClientset, cloud)
-	if err != nil {
-		r.log.Error(rerr, "failed to populated cluster Spec")
-		return resultError, err
-	}
-
-	err = r.createOrUpdateKopsCluster(ctx, r.kopsClientset, fullCluster, kopsControlPlane.Spec.SSHPublicKey, cloud)
-	if err != nil {
-		r.log.Error(err, fmt.Sprintf("failed to manage kops state: %v", err))
-		conditions.MarkFalse(kopsControlPlane, controlplanev1alpha1.KopsControlPlaneStateReadyCondition, controlplanev1alpha1.KopsControlPlaneStateReconciliationFailedReason, clusterv1.ConditionSeverityError, err.Error())
-		return resultError, err
-	}
-	conditions.MarkTrue(kopsControlPlane, controlplanev1alpha1.KopsControlPlaneStateReadyCondition)
-
-	if kopsControlPlane.Spec.KopsSecret != nil {
-		secretStore, err := r.kopsClientset.SecretStore(kopsCluster)
-		if err != nil {
-			return resultError, err
-		}
-
-		err = utils.ReconcileKopsSecrets(ctx, r.Client, secretStore, kopsControlPlane, client.ObjectKey{
-			Name:      kopsControlPlane.Spec.KopsSecret.Name,
-			Namespace: kopsControlPlane.Spec.KopsSecret.Namespace,
-		})
-		if err != nil {
-			conditions.MarkFalse(kopsControlPlane, controlplanev1alpha1.KopsControlPlaneSecretsReadyCondition, controlplanev1alpha1.KopsControlPlaneSecretsReconciliationFailedReason, clusterv1.ConditionSeverityWarning, err.Error())
-		}
-		conditions.MarkTrue(kopsControlPlane, controlplanev1alpha1.KopsControlPlaneSecretsReadyCondition)
-	}
-
-	terraformOutputDir := fmt.Sprintf("/tmp/%s", kopsCluster.Name)
-
 	var shouldIgnoreSG bool
 	if _, ok := owner.GetAnnotations()["kopscontrolplane.controlplane.wildlife.io/external-security-groups"]; ok {
 		shouldIgnoreSG = true
 	}
 
-	err = r.PrepareCloudResourcesFactory(r.kopsClientset, r.Client, ctx, kopsCluster, kopsControlPlane, fullCluster.Spec.ConfigBase, terraformOutputDir, cloud, shouldIgnoreSG)
+	terraformOutputDir := fmt.Sprintf("/tmp/%s", kopsCluster.Name)
+
+	err = r.generateTerraformFiles(ctx, kopsControlPlane, kopsCluster, terraformOutputDir, shouldIgnoreSG)
 	if err != nil {
-		conditions.MarkFalse(kopsControlPlane, controlplanev1alpha1.KopsTerraformGenerationReadyCondition, controlplanev1alpha1.KopsTerraformGenerationReconciliationFailedReason, clusterv1.ConditionSeverityError, err.Error())
-		r.log.Error(err, fmt.Sprintf("failed to prepare cloud resources: %v", err))
 		return resultError, err
 	}
 	conditions.MarkTrue(kopsControlPlane, controlplanev1alpha1.KopsTerraformGenerationReadyCondition)
